@@ -124,6 +124,7 @@ const SAFE_MCP_DAEMON_RETRY_CALLS = new Set([
   'list_plugins',
   'list_projects',
   'list_resources',
+  'list_runs',
   'list_skills',
   'read_resource',
   'search_files',
@@ -798,6 +799,11 @@ export const TOOL_DEFS = [
           type: 'string',
           description: "Service tier override for the selected model, e.g. 'priority' for Codex Fast. Optional.",
         },
+        conversation: {
+          type: 'string',
+          description:
+            'Conversation id (from create_conversation) to run in. Optional; omitted runs land in the project\'s default conversation. An id that does not belong to the project is rejected, never replaced by the default.',
+        },
         requestId: {
           type: 'string',
           description:
@@ -813,6 +819,37 @@ export const TOOL_DEFS = [
       additionalProperties: false,
     },
     annotations: { ...WRITE_ANNOTATIONS, title: 'Generate with OpenDesign' },
+  },
+  {
+    name: 'create_conversation',
+    description:
+      'Create a new conversation (separate chat thread) in a project and return its id. Pass the id as start_run.conversation so concurrent agents working in one shared project each get their own thread instead of sharing the default one.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        project: PROJECT_ARG,
+        title: { type: 'string', description: 'Optional conversation title.' },
+        pluginWorkflowId: PLUGIN_WORKFLOW_ID_ARG,
+      },
+      additionalProperties: false,
+    },
+    annotations: { ...WRITE_ANNOTATIONS, title: 'Create OpenDesign conversation' },
+  },
+  {
+    name: 'list_runs',
+    description:
+      'List runs in a project, optionally narrowed to one conversation and/or one status (queued|running|succeeded|failed|canceled). Returns id, status, conversationId, projectId, createdAt and updatedAt for each run.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        project: PROJECT_ARG,
+        conversation: { type: 'string', description: 'Only runs in this conversation id. Optional.' },
+        status: { type: 'string', description: 'Only runs with this status. Optional.' },
+        pluginWorkflowId: PLUGIN_WORKFLOW_ID_ARG,
+      },
+      additionalProperties: false,
+    },
+    annotations: { ...READ_ANNOTATIONS, title: 'List OpenDesign runs' },
   },
   {
     name: 'get_run',
@@ -1962,7 +1999,10 @@ async function runMcpStdioImplementation(options: RunMcpOptions): Promise<void> 
         '    returned list will actually spawn on this machine.',
         ' - create_project(name) first if you need a fresh project to',
         '    generate into; start_run requires an existing project.',
-        ' - start_run(prompt, requestId, [skill], [plugin], [inputs]) kicks off',
+        ' - create_conversation(project, [title]) returns a conversationId; pass it',
+        '    as start_run.conversation so each agent sharing a project works in its',
+        '    own thread. Without it, runs land in the project\'s default conversation.',
+        ' - start_run(prompt, requestId, [conversation], [skill], [plugin], [inputs]) kicks off',
         '    generation in the active or named project and returns a runId.',
         '    Generate a canonical UUID or ULID requestId once per confirmed',
         '    user action and reuse the exact same value after a timeout/lost',
@@ -1975,6 +2015,7 @@ async function runMcpStdioImplementation(options: RunMcpOptions): Promise<void> 
         ' - get_run(runId) polls until status is succeeded/failed/canceled;',
         '    on success it returns a previewUrl you can open in a browser',
         '    and a hint to pull the files with get_artifact.',
+        ' - list_runs(project, [conversation], [status]) lists a project\'s runs.',
         ' - cancel_run(runId) aborts an in-flight run.',
         '',
         'Generation patience: OpenDesign runs typically take 5–30',
@@ -2157,6 +2198,8 @@ const PROJECT_OR_RUN_TOOLS = new Set([
   'start_run',
   'get_run',
   'cancel_run',
+  'create_conversation',
+  'list_runs',
 ]);
 
 async function handleMcpToolCall(
@@ -2369,6 +2412,10 @@ async function handleMcpToolCall(
         return await startRun(baseUrl, args, options, headers);
       case 'get_run':
         return await getRun(baseUrl, args, headers);
+      case 'create_conversation':
+        return await createConversation(baseUrl, args, headers);
+      case 'list_runs':
+        return await listRuns(baseUrl, args, headers);
       case 'cancel_run': {
         requireString(args.runId, 'runId');
         return ok(
@@ -2671,6 +2718,11 @@ async function startRun(
     body.message = args.prompt;
     body.currentPrompt = args.prompt;
   }
+  if (args.conversation !== undefined) {
+    requireString(args.conversation, 'conversation');
+    // The run route 404s CONVERSATION_NOT_FOUND for an id outside the project.
+    body.conversationId = args.conversation;
+  }
   if (typeof args.skill === 'string' && args.skill.length > 0) body.skillId = args.skill;
   if (Array.isArray(args.skills) && args.skills.length > 0) body.skillIds = args.skills;
   if (typeof args.plugin === 'string' && args.plugin.length > 0) body.pluginId = args.plugin;
@@ -2720,6 +2772,49 @@ async function startRun(
       resolved,
     ),
   );
+}
+
+async function createConversation(
+  baseUrl: string,
+  args: McpArgs,
+  headers?: Record<string, string>,
+) {
+  const { id, resolved, active } = await resolveProjectArg(baseUrl, args.project, headers);
+  const body: JsonObject = {};
+  if (typeof args.title === 'string' && args.title.length > 0) body.title = args.title;
+  const created = await postJson<{ conversation?: JsonObject }>(
+    `${baseUrl}/api/projects/${encodeURIComponent(id)}/conversations`,
+    body,
+    headers ?? {},
+  );
+  return ok(
+    withActiveEcho(
+      { projectId: id, conversationId: created.conversation?.id ?? null, conversation: created.conversation ?? null },
+      active,
+      resolved,
+    ),
+  );
+}
+
+async function listRuns(
+  baseUrl: string,
+  args: McpArgs,
+  headers?: Record<string, string>,
+) {
+  const { id, resolved, active } = await resolveProjectArg(baseUrl, args.project, headers);
+  const params = new URLSearchParams({ projectId: id });
+  if (typeof args.conversation === 'string' && args.conversation) params.set('conversationId', args.conversation);
+  if (typeof args.status === 'string' && args.status) params.set('status', args.status);
+  const data = await getJson<{ runs?: JsonObject[] }>(`${baseUrl}/api/runs?${params.toString()}`, headers);
+  const runs = (data.runs ?? []).map((r) => ({
+    id: r.id,
+    status: r.status,
+    conversationId: r.conversationId ?? null,
+    projectId: r.projectId ?? id,
+    createdAt: r.createdAt,
+    updatedAt: r.updatedAt,
+  }));
+  return ok(withActiveEcho({ runs }, active, resolved));
 }
 
 // Poll a run. On terminal status we enrich the daemon's status body
